@@ -177,6 +177,8 @@ restrict_region(pagetable_t pagetable, uint64 start, uint64 end)
 static void
 emit_pmp_layout(void)
 {
+    if(!vm_state.pmp_enabled)
+        return;
     uint64 prev = 0;
     for(int i = 0; i < MAX_PMP_ENTRIES; i++){
         uint64 top = pmp_addr_value(i);
@@ -280,8 +282,6 @@ rebuild_pmp_tables(struct proc *process)
         proc_freepagetable(process->vm_pmp_pagetable, process->sz);
 
     process->vm_pmp_pagetable = restricted;
-    emit_pmp_layout();
-    switch_guest_pagetable(process);
 }
 
 //csrr handler
@@ -354,6 +354,7 @@ int handle_mret(struct proc *process) {
     vm_state.registers[REG_MSTATUS].value = status_register;
 
     process->trapframe->epc = vm_state.registers[REG_MEPC].value;
+    emit_pmp_layout();
     switch_guest_pagetable(process);
     return 0;
 }
