@@ -36,13 +36,13 @@ void usertrap(void) {
   /* traps here when back from the userspace code. */
   p.trapframe->epc = r_sepc() + 4;
   // CSE536: Uncomment for PMP Test 3 & 4
-  // int* page = (int *)kalloc();
+  int* page = (int *)kalloc();
   
   // Uncomment for Test 4 
   // *page = *(int *)0x220000;
   
   // Uncomment for Test 3
-  // *page = *(int *)0x110000;
+  *page = *(int *)0x110000;
 
   usertrapret();
 }

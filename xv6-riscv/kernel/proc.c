@@ -155,19 +155,36 @@ found:
 static void
 freeproc(struct proc *p)
 {
+  pagetable_t active = p->pagetable;
+  pagetable_t host = p->vm_host_pagetable;
+  pagetable_t pmp = p->vm_pmp_pagetable;
+
   if (strncmp(p->name, "vm-", 3) == 0) {
     // CSE 536: Also unmap the VM memory region
     uint64 memaddr_start = 0x80000000;
     uint64 memaddr_count = 1024;
-    uvmunmap(p->pagetable, memaddr_start, memaddr_count, 0);
+    if(active){
+      int reclaim = (pmp && active == pmp && pmp != host);
+      uvmunmap(active, memaddr_start, memaddr_count, reclaim);
+    }
+    if(host && host != active)
+      uvmunmap(host, memaddr_start, memaddr_count, 0);
+    if(pmp && pmp != active && pmp != host)
+      uvmunmap(pmp, memaddr_start, memaddr_count, 1);
   }
 
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
-  if(p->pagetable)
-    proc_freepagetable(p->pagetable, p->sz);
+  if(active)
+    proc_freepagetable(active, p->sz);
+  if(host && host != active)
+    proc_freepagetable(host, p->sz);
+  if(pmp && pmp != active && pmp != host)
+    proc_freepagetable(pmp, p->sz);
   p->pagetable = 0;
+  p->vm_host_pagetable = 0;
+  p->vm_pmp_pagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;

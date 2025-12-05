@@ -5,6 +5,15 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include <stdbool.h>
+
+//defining traps
+const int INSTRUCTION_FAULT = 2;
+const int LOAD_FAULT = 1;
+const int INSTRUCTION_PAGE_FAULT = 12;
+const int LOAD_PAGE_FAULT = 13;
+const int STORE_PAGE_FAULT = 15;
+const int SYSTEM_CALL = 8;
 
 struct spinlock tickslock;
 uint ticks;
@@ -49,21 +58,37 @@ usertrap(void)
   
   // save user program counter.
   p->trapframe->epc = r_sepc();
+  
+  uint64 trap_cause = r_scause();
+  bool is_vm_process = strncmp(p->name, "vm-", 3) == 0;
 
-  if(r_scause() == 8){
-    // system call
-    if(killed(p))
-      exit(-1);
+    //Fault handling
+    if (is_vm_process && (trap_cause == INSTRUCTION_FAULT || trap_cause == LOAD_FAULT ||
+                trap_cause == INSTRUCTION_PAGE_FAULT ||
+                trap_cause == LOAD_PAGE_FAULT || trap_cause == STORE_PAGE_FAULT)) {
+        trap_and_emulate();
+    }
 
-    // sepc points to the ecall instruction,
-    // but we want to return to the next instruction.
-    p->trapframe->epc += 4;
+    //Handle system calls
+  else if (trap_cause == SYSTEM_CALL) {
+        if (killed(p)) {
+            exit(-1);
+        }
 
-    // an interrupt will change sepc, scause, and sstatus,
-    // so enable only now that we're done with those registers.
-    intr_on();
+        if (is_vm_process) {   //VM system calls
+            trap_and_emulate();
+        }
+    else{
+    	// sepc points to the ecall instruction,
+    	// but we want to return to the next instruction.
+    	p->trapframe->epc += 4;
 
-    syscall();
+    	// an interrupt will change sepc, scause, and sstatus,
+    	// so enable only now that we're done with those registers.
+    	intr_on();
+
+    	syscall();
+   }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {

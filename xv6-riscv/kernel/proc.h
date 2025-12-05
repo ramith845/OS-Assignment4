@@ -107,4 +107,8 @@ struct proc {
 
   // CSE 536: track that this is a VM and ecall must be handled differently
   int proc_te_vm;
+
+  // CSE 536: keep full-access and PMP-restricted copies of the VM page tables
+  pagetable_t vm_host_pagetable;
+  pagetable_t vm_pmp_pagetable;
 };
