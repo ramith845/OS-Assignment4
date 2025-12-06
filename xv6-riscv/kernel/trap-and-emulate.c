@@ -8,14 +8,12 @@
 #include "stdbool.h"
 #include "stdlib.h"
 
-//defining registers and modes
 #define REG_COUNT 41
 #define REG_SSTATUS 8
 #define REG_SEPC 15
 #define REG_MSTATUS 24
 #define REG_MEPC 32
 #define REG_STVEC 12
-#define REG_SATP 19
 #define REG_MCVENDORID 20
 #define REG_PMPCFG0 38
 #define REG_PMPADDR0 39
@@ -40,23 +38,21 @@
 #define LOAD_PAGE_FAULT 13
 #define STORE_PAGE_FAULT 15
 
-// Struct to keep VM registers (Sample; feel free to change.)
-typedef struct {
-    int reg_code;
-    int privilege_level;
-    uint64 value;
-    uint8 flags;
-    uint64 last_update;
-} VMRegister;
+struct vm_reg {
+    int     code;
+    int     mode;
+    uint64  val;
+};
 
-typedef struct {
-    VMRegister registers[REG_COUNT];
+struct vm_virtual_state {
+    struct vm_reg registers[REG_COUNT];
     int current_privilege;
     bool pmp_enabled;
     pagetable_t virtual_pagetable;
-} VMState;
+    struct vm_reg tmp;
+};
 
-VMState vm_state;
+struct vm_virtual_state vm_state;
 
 static uint64 read_guest_reg(struct trapframe *tf, unsigned int reg);
 static void write_guest_reg(struct trapframe *tf, unsigned int reg, uint64 value);
@@ -67,11 +63,6 @@ static void emit_pmp_layout(void);
 static void switch_guest_pagetable(struct proc *process);
 static int copy_vm_region(pagetable_t dst, pagetable_t src, uint64 start, uint64 end);
 static void handle_pmp_fault(struct proc *process, uint64 scause);
-
-
-void initialize_register(int index, uint32 code, int mode, uint64 value) {
-    vm_state.registers[index] = (VMRegister){.reg_code = code, .privilege_level = mode, .value = value, .flags = 0, .last_update = 0};
-}
 
 static uint64*
 guest_reg_ptr(struct trapframe *tf, unsigned int reg)
@@ -97,43 +88,28 @@ write_guest_reg(struct trapframe *tf, unsigned int reg, uint64 value)
 }
 
 static inline uint64
-pmp_cfg_byte(int index)
+pmp_addr_value(int idx)
 {
-    return (vm_state.registers[REG_PMPCFG0].value >> (index * 8)) & 0xff;
-}
-
-static inline uint64
-pmp_addr_value(int index)
-{
-    if(index == 0)
-        return vm_state.registers[REG_PMPADDR0].value << 2;
-    if(index == 1)
-        return vm_state.registers[REG_PMPADDR1].value << 2;
+    if(idx == 1)
+        return vm_state.registers[REG_PMPADDR1].val << 2;
+    else if(idx == 0)
+        return vm_state.registers[REG_PMPADDR0].val << 2;
     return 0;
 }
 
-bool is_invalid_mcvendorid_write(int csr_index, uint64 value) { //check for invalid write
-    return (csr_index == REG_MCVENDORID) && (value == 0x0);
+static inline uint64
+pmp_cfg_byte(int idx)
+{
+    return (vm_state.registers[REG_PMPCFG0].val >> (idx * 8)) & 0xff;
 }
 
-void enable_pmp_if_needed(int csr_index) { //check for pmp
-    if (csr_index == REG_PMPADDR0 || csr_index == REG_PMPADDR1 || csr_index == REG_PMPCFG0) {
-        vm_state.pmp_enabled = true;
-    }
-}
-
-int locate_csr(unsigned int csr_code) {
-    for (int i = 0; i < REG_COUNT; i++) {
-        if (vm_state.registers[i].reg_code == csr_code) {
+int find_csr_index(unsigned int csr) {
+    int i = REG_COUNT;
+    while(i-- > 0) {
+        if (vm_state.registers[i].code == csr)
             return i;
-        }
     }
-    return -1;  
-}
-
-void print_instruction(uint64 virtual_address, uint32 opcode, uint32 rd, uint32 funct3, uint32 rs1, uint32 uimm, const char* prefix) {
-    printf("(%s at %p) op = %x, rd = %x, funct3 = %x, rs1 = %x, uimm = %x\n",
-           prefix, virtual_address, opcode, rd, funct3, rs1, uimm);
+    return -1;
 }
 
 bool is_pmp_register(int csr_index) {
@@ -160,17 +136,17 @@ copy_vm_region(pagetable_t dst, pagetable_t src, uint64 start, uint64 end)
 }
 
 static void
-restrict_region(pagetable_t pagetable, uint64 start, uint64 end)
+restrict_region(pagetable_t pt, uint64 start, uint64 end)
 {
-    if(end <= start)
+    if(start >= end)
         return;
-    uint64 begin = PGROUNDDOWN(start);
+    uint64 va = PGROUNDDOWN(start);
     uint64 finish = PGROUNDUP(end);
-    for(uint64 va = begin; va < finish; va += PGSIZE){
-        pte_t *pte = walk(pagetable, va, 0);
-        if(pte && (*pte & PTE_V)){
+    while(va < finish){
+        pte_t *pte = walk(pt, va, 0);
+        if(pte && (*pte & PTE_V))
             *pte &= ~PTE_U;
-        }
+        va += PGSIZE;
     }
 }
 
@@ -191,77 +167,74 @@ emit_pmp_layout(void)
 }
 
 static void
-switch_guest_pagetable(struct proc *process)
+switch_guest_pagetable(struct proc *p)
 {
-    if(process->vm_host_pagetable == 0)
-        process->vm_host_pagetable = process->pagetable;
+    if(p->vm_host_pagetable == 0)
+        p->vm_host_pagetable = p->pagetable;
 
     if(!vm_state.pmp_enabled || vm_state.current_privilege == MACHINE_MODE){
-        if(process->vm_host_pagetable)
-            process->pagetable = process->vm_host_pagetable;
-    } else if(process->vm_pmp_pagetable){
-        process->pagetable = process->vm_pmp_pagetable;
+        if(p->vm_host_pagetable)
+            p->pagetable = p->vm_host_pagetable;
+    } else if(p->vm_pmp_pagetable){
+        p->pagetable = p->vm_pmp_pagetable;
     }
 }
 
 static void
-handle_pmp_fault(struct proc *process, uint64 scause)
+handle_pmp_fault(struct proc *p, uint64 scause)
 {
     printf("Page Fault Occured. Probably due to PMP Violation\n");
     uint64 fault_addr = r_stval();
     if(scause == INSTRUCTION_PAGE_FAULT)
-        fault_addr = process->trapframe->epc;
+        fault_addr = p->trapframe->epc;
     printf("Accessing Address: %p\n", fault_addr);
-    setkilled(process);
+    setkilled(p);
     trap_and_emulate_init();
 }
 
-static bool
-has_active_tor_entry(void)
-{
-    for(int i = 0; i < MAX_PMP_ENTRIES; i++){
-        uint64 cfg = pmp_cfg_byte(i);
-        uint64 mode = (cfg >> PMP_CFG_A_SHIFT) & PMP_CFG_A_MASK;
-        if(mode == PMP_CFG_TOR)
-            return true;
-    }
-    return false;
-}
-
 static void
-rebuild_pmp_tables(struct proc *process)
+rebuild_pmp_tables(struct proc *p)
 {
-    if(!has_active_tor_entry()){
-        vm_state.pmp_enabled = false;
-        if(process->vm_pmp_pagetable){
-            proc_freepagetable(process->vm_pmp_pagetable, process->sz);
-            process->vm_pmp_pagetable = 0;
+    int has_tor = 0, i = 0;
+    while(i < MAX_PMP_ENTRIES){
+        if(((pmp_cfg_byte(i) >> PMP_CFG_A_SHIFT) & PMP_CFG_A_MASK) == PMP_CFG_TOR){
+            has_tor = 1;
+            break;
         }
-        switch_guest_pagetable(process);
+        i++;
+    }
+    
+    if(!has_tor){
+        vm_state.pmp_enabled = false;
+        if(p->vm_pmp_pagetable){
+            proc_freepagetable(p->vm_pmp_pagetable, p->sz);
+            p->vm_pmp_pagetable = 0;
+        }
+        switch_guest_pagetable(p);
         return;
     }
 
     vm_state.pmp_enabled = true;
-    if(process->vm_host_pagetable == 0)
-        process->vm_host_pagetable = process->pagetable;
+    if(p->vm_host_pagetable == 0)
+        p->vm_host_pagetable = p->pagetable;
 
-    pagetable_t restricted = proc_pagetable(process);
+    pagetable_t restricted = proc_pagetable(p);
     if(restricted == 0){
-        setkilled(process);
+        setkilled(p);
         return;
     }
 
-    if(uvmcopy(process->vm_host_pagetable, restricted, process->sz) < 0){
-        proc_freepagetable(restricted, process->sz);
-        setkilled(process);
+    if(uvmcopy(p->vm_host_pagetable, restricted, p->sz) < 0){
+        proc_freepagetable(restricted, p->sz);
+        setkilled(p);
         return;
     }
 
-    if(strncmp(process->name, "vm-", 3) == 0){
-        if(copy_vm_region(restricted, process->vm_host_pagetable,
+    if(strncmp(p->name, "vm-", 3) == 0){
+        if(copy_vm_region(restricted, p->vm_host_pagetable,
                           VM_REGION_START, VM_REGION_START + VM_REGION_SIZE) < 0){
-            proc_freepagetable(restricted, process->sz);
-            setkilled(process);
+            proc_freepagetable(restricted, p->sz);
+            setkilled(p);
             return;
         }
     }
@@ -269,243 +242,192 @@ rebuild_pmp_tables(struct proc *process)
     uint64 prev = 0;
     for(int i = 0; i < MAX_PMP_ENTRIES; i++){
         uint64 top = pmp_addr_value(i);
-        if(top > prev){
-            uint64 cfg = pmp_cfg_byte(i);
-            uint64 mode = (cfg >> PMP_CFG_A_SHIFT) & PMP_CFG_A_MASK;
-            if(mode == PMP_CFG_TOR)
-                restrict_region(restricted, prev, top);
-        }
+        if(top > prev && ((pmp_cfg_byte(i) >> PMP_CFG_A_SHIFT) & PMP_CFG_A_MASK) == PMP_CFG_TOR)
+            restrict_region(restricted, prev, top);
         prev = top;
     }
 
-    if(process->vm_pmp_pagetable)
-        proc_freepagetable(process->vm_pmp_pagetable, process->sz);
+    if(p->vm_pmp_pagetable)
+        proc_freepagetable(p->vm_pmp_pagetable, p->sz);
 
-    process->vm_pmp_pagetable = restricted;
+    p->vm_pmp_pagetable = restricted;
 }
 
-//csrr handler
-int handle_csrr(struct proc *process, unsigned int source_reg, unsigned int dest_reg, unsigned int csr_code) {
-    int csr_index = locate_csr(csr_code);
+int emulate_csrr(struct proc *p, unsigned int src, unsigned int dst, unsigned int csr) {
+    int csr_index = find_csr_index(csr);
     if (csr_index == -1) return -1;
-
-    if (vm_state.current_privilege >= vm_state.registers[csr_index].privilege_level) {
-        uint64 csr_value = vm_state.registers[csr_index].value;
-        write_guest_reg(process->trapframe, dest_reg, csr_value);
-    } else {
-        return -2; 
-    }
-    process->trapframe->epc += 4;
+    if (vm_state.current_privilege < vm_state.registers[csr_index].mode)
+        return -2;
+    write_guest_reg(p->trapframe, dst, vm_state.registers[csr_index].val);
+    p->trapframe->epc += 4;
     return 0;
 }
 
-//csrw handler
-int handle_csrw(struct proc *process, unsigned int source_reg, unsigned int dest_reg, unsigned int csr_code) {
-    int csr_index = locate_csr(csr_code);
+int emulate_csrw(struct proc *p, unsigned int src, unsigned int dst, unsigned int csr) {
+    int csr_index = find_csr_index(csr);
     if (csr_index == -1) return CSRW_NOT_FOUND;
-
-    if (vm_state.current_privilege >= vm_state.registers[csr_index].privilege_level) {
-        uint64 value = read_guest_reg(process->trapframe, source_reg);
-
-        if (is_invalid_mcvendorid_write(csr_index, value)) {
-            return CSRW_INVALID_MCVENDORID;
-        }
-
-        enable_pmp_if_needed(csr_index); //pmp enabled
-        vm_state.registers[csr_index].value = value;
-        if(is_pmp_register(csr_index))
-            rebuild_pmp_tables(process);
-    } else {
+    if (vm_state.current_privilege < vm_state.registers[csr_index].mode)
         return CSRW_INSUFFICIENT_PRIVILEGE;
-    }
-    process->trapframe->epc += 4;
+    
+    uint64 val = read_guest_reg(p->trapframe, src);
+    if (csr_index == REG_MCVENDORID && val == 0x0)
+        return CSRW_INVALID_MCVENDORID;
+    
+    vm_state.registers[csr_index].val = val;
+    if (csr_index == REG_PMPADDR0 || csr_index == REG_PMPADDR1 || csr_index == REG_PMPCFG0)
+        vm_state.pmp_enabled = true;
+    if(is_pmp_register(csr_index))
+        rebuild_pmp_tables(p);
+    p->trapframe->epc += 4;
     return CSRW_SUCCESS;
 }
 
-//sret handler
-int handle_sret(struct proc *process) {
+int emulate_sret(struct proc *p) {
     if (vm_state.current_privilege < SUPERVISOR_MODE) return -1;
-
-    unsigned long status_register = vm_state.registers[REG_SSTATUS].value;
-    unsigned long spp_bit = (status_register >> 8) & 0x1;
-
-    status_register &= ~(1UL << 5);  //clearing spie
-    status_register |= ((status_register >> 5) & 0x1) << 1;  // Set SIE
-    status_register &= ~(1UL << 8);  //clearing SPP 
-
-    vm_state.current_privilege = spp_bit ? SUPERVISOR_MODE : USER_MODE;
-    vm_state.registers[REG_SSTATUS].value = status_register;
-
-    process->trapframe->epc = vm_state.registers[REG_SEPC].value;
-    switch_guest_pagetable(process);
+    unsigned long sstatus = vm_state.registers[REG_SSTATUS].val;
+    int spp = (sstatus >> 8) & 0x1;
+    sstatus = (sstatus & ~(1UL << 5)) | (((sstatus >> 5) & 0x1) << 1);
+    sstatus &= ~(1UL << 8);
+    vm_state.registers[REG_SSTATUS].val = sstatus;
+    vm_state.current_privilege = spp ? SUPERVISOR_MODE : USER_MODE;
+    p->trapframe->epc = vm_state.registers[REG_SEPC].val;
+    switch_guest_pagetable(p);
     return 0;
 }
 
-//handling mret
-int handle_mret(struct proc *process) {
+int emulate_mret(struct proc *p) {
     if (vm_state.current_privilege < MACHINE_MODE) return -1;
 
-    unsigned long status_register = vm_state.registers[REG_MSTATUS].value;
-    unsigned long previous_mode = (status_register >> 11) & 0x1;
+    unsigned long mstatus = vm_state.registers[REG_MSTATUS].val;
+    vm_state.current_privilege = ((mstatus >> 11) & 0x1) ? SUPERVISOR_MODE : USER_MODE;
+    mstatus &= ~(1UL << 5);
+    mstatus |= ((mstatus >> 7) & 0x1) << 3;
+    vm_state.registers[REG_MSTATUS].val = mstatus;
 
-    status_register &= ~(1UL << 5);  //clearing mpp bits
-    status_register |= ((status_register >> 7) & 0x1) << 3;  // Set MIE
-    vm_state.current_privilege = previous_mode ? SUPERVISOR_MODE : USER_MODE;
-    vm_state.registers[REG_MSTATUS].value = status_register;
-
-    process->trapframe->epc = vm_state.registers[REG_MEPC].value;
+    p->trapframe->epc = vm_state.registers[REG_MEPC].val;
     emit_pmp_layout();
-    switch_guest_pagetable(process);
+    switch_guest_pagetable(p);
     return 0;
 }
 
-//ecall handler
-int handle_ecall(struct proc *process) {
-    if (vm_state.registers[REG_STVEC].value == 0) return ECALL_INVALID_STVEC;
-
-    vm_state.registers[REG_SEPC].value = process->trapframe->epc;
-    process->trapframe->epc = vm_state.registers[REG_STVEC].value;
+int emulate_ecall(struct proc *p) {
+    if (vm_state.registers[REG_STVEC].val == 0) return ECALL_INVALID_STVEC;
+    vm_state.registers[REG_SEPC].val = p->trapframe->epc;
+    p->trapframe->epc = vm_state.registers[REG_STVEC].val;
     vm_state.current_privilege = SUPERVISOR_MODE;
-    switch_guest_pagetable(process);
+    switch_guest_pagetable(p);
     return ECALL_SUCCESS;
 }
 
 void trap_and_emulate(void) {
-/* Comes here when a VM tries to execute a supervisor instruction. */
-    struct proc *process = myproc();
+    struct proc *p = myproc();
     uint64 scause = r_scause();
 
-    if(scause == LOAD_PAGE_FAULT || scause == STORE_PAGE_FAULT){
-        handle_pmp_fault(process, scause);
-        return;
-    }
-    if(scause == INSTRUCTION_PAGE_FAULT){
-        handle_pmp_fault(process, scause);
-        return;
-    }
-    
-/* Retrieve all required values from the instruction */
-    uint64 virtual_address = r_sepc();
-    uint64 physical_address = walkaddr(process->pagetable, virtual_address) | (virtual_address & 0xFFF);
-
-    if (physical_address == 0) {
-        printf("Invalid virtual address: %p\n", virtual_address);
-        setkilled(process);
+    if(scause == LOAD_PAGE_FAULT || scause == STORE_PAGE_FAULT || scause == INSTRUCTION_PAGE_FAULT){
+        handle_pmp_fault(p, scause);
         return;
     }
 
-    uint32 instruction = *((uint32 *)(physical_address));
-    uint32 opcode = instruction & 0x7F;
-    uint32 rd = (instruction >> 7) & 0x1F;
-    uint32 funct3 = (instruction >> 12) & 0x7;
-    uint32 rs1 = (instruction >> 15) & 0x1F;
-    uint32 uimm = (instruction >> 20) & 0xFFF;
+    uint64 va = r_sepc();
+    uint64 pa = walkaddr(p->pagetable, va) | (va & 0xFFF);
 
-    // In your ECALL, add the following for prints
-// struct proc* p = myproc();
-// printf("(EC at %p)\n", p->trapframe->epc);
-
-
-    if (funct3 == 0x0 && uimm == 0x0) {
-        printf("(EC at %p)\n", process->trapframe->epc);
+    if (pa == 0) {
+        printf("Invalid virtual address: %p\n", va);
+        setkilled(p);
+        return;
     }
 
-    /* Print the statement */
-    printf("(PI at %p) op = %x, rd = %x, funct3 = %x, rs1 = %x, uimm = %x\n",
-           virtual_address, opcode, rd, funct3, rs1, uimm);
+    uint32 inst = *((uint32 *)(pa));
+    uint32 op = inst & 0x7F, dst = (inst >> 7) & 0x1F, funct3 = (inst >> 12) & 0x7;
+    uint32 src = (inst >> 15) & 0x1F, csr = (inst >> 20) & 0xFFF;
 
-    if (funct3 == 0x0 && uimm == 0x0) {
-        if (handle_ecall(process) != 0) {
-            setkilled(process);
+    if (funct3 == 0x0 && csr == 0x0) {
+        printf("(EC at %p)\n", p->trapframe->epc);
+        if (emulate_ecall(p) != 0) {
+            setkilled(p);
         }
         return;
     }
 
-    
+    printf("(PI at %p) op = %x, rd = %x, funct3 = %x, rs1 = %x, uimm = %x\n",
+           va, op, dst, funct3, src, csr);
+
     switch (funct3) {
         case 0x0:
-            //handling SRET and MRET
-            switch (uimm) {
+            switch (csr) {
                 case 0x102:
-                    if (handle_sret(process) != 0) {
-                        setkilled(process);
+                    if (emulate_sret(p) != 0) {
+                        setkilled(p);
                     }
                     return;
                 case 0x302:
-                    if (handle_mret(process) != 0) {
-                        setkilled(process);
+                    if (emulate_mret(p) != 0) {
+                        setkilled(p);
                     }
                     return;
                 default:
                     break;
             }
             break;
-         //handling csrw
         case 0x1:
-            if (handle_csrw(process, rs1, rd, uimm) == 0) {
+            if (emulate_csrw(p, src, dst, csr) == 0) {
                 return;
             }
             break;
-	//handling csrr
         case 0x2:
-            if (handle_csrr(process, rs1, rd, uimm) == 0) {
+            if (emulate_csrr(p, src, dst, csr) == 0) {
                 return;
             }
             break;
     }
 
-    //handling other instructions
-    //printf("Unhandled or invalid instruction at virtual_address: %p\n", virtual_address);
-    setkilled(process);
+    setkilled(p);
     trap_and_emulate_init();
 }
 
-
-// Initialization
 void trap_and_emulate_init(void) {
-/* Create and initialize all state for the VM */
     vm_state.pmp_enabled = false;
 
-    initialize_register(0, 0x000, 0, 0);
-    initialize_register(1, 0x004, 0, 0);
-    initialize_register(3, 0x040, 0, 0);
-    initialize_register(4, 0x041, 0, 0);
-    initialize_register(5, 0x042, 0, 0);
-    initialize_register(6, 0x043, 0, 0);
-    initialize_register(7, 0x044, 0, 0);
-    initialize_register(8, 0x100, 1, 0);
-    initialize_register(9, 0x102, 1, 0);
-    initialize_register(10, 0x103, 1, 0);
-    initialize_register(11, 0x104, 1, 0);
-    initialize_register(12, 0x105, 1, 0);
-    initialize_register(13, 0x106, 1, 0);
-    initialize_register(14, 0x140, 1, 0);
-    initialize_register(15, 0x141, 1, 0);
-    initialize_register(16, 0x142, 1, 0);
-    initialize_register(17, 0x143, 1, 0);
-    initialize_register(18, 0x144, 1, 0);
-    initialize_register(19, 0x180, 1, 0);
-    initialize_register(20, 0xf11, 1, 0x637365353336); //CSE536 hexadec code
-    initialize_register(21, 0xf12, 2, 0);
-    initialize_register(22, 0xf13, 2, 0);
-    initialize_register(23, 0xf14, 2, 0);
-    initialize_register(24, 0x300, 2, 0);
-    initialize_register(25, 0x301, 2, 0);
-    initialize_register(26, 0x302, 2, 0);
-    initialize_register(27, 0x303, 2, 0);
-    initialize_register(28, 0x304, 2, 0);
-    initialize_register(29, 0x305, 2, 0);
-    initialize_register(30, 0x306, 2, 0);
-    initialize_register(31, 0x340, 2, 0);
-    initialize_register(32, 0x341, 2, 0);
-    initialize_register(33, 0x342, 2, 0);
-    initialize_register(34, 0x343, 2, 0);
-    initialize_register(35, 0x344, 2, 0);
-    initialize_register(36, 0x34a, 2, 0);
-    initialize_register(37, 0x34b, 2, 0);
-    initialize_register(38, 0x3a0, 2, 0);
-    initialize_register(39, 0x3b0, 2, 0);
-    initialize_register(40, 0x3b1, 2, 0);
+    vm_state.registers[0] = (struct vm_reg){0x000, 0, 0};
+    vm_state.registers[1] = (struct vm_reg){0x004, 0, 0};
+    vm_state.registers[3] = (struct vm_reg){0x040, 0, 0};
+    vm_state.registers[4] = (struct vm_reg){0x041, 0, 0};
+    vm_state.registers[5] = (struct vm_reg){0x042, 0, 0};
+    vm_state.registers[6] = (struct vm_reg){0x043, 0, 0};
+    vm_state.registers[7] = (struct vm_reg){0x044, 0, 0};
+    vm_state.registers[8] = (struct vm_reg){0x100, 1, 0};
+    vm_state.registers[9] = (struct vm_reg){0x102, 1, 0};
+    vm_state.registers[10] = (struct vm_reg){0x103, 1, 0};
+    vm_state.registers[11] = (struct vm_reg){0x104, 1, 0};
+    vm_state.registers[12] = (struct vm_reg){0x105, 1, 0};
+    vm_state.registers[13] = (struct vm_reg){0x106, 1, 0};
+    vm_state.registers[14] = (struct vm_reg){0x140, 1, 0};
+    vm_state.registers[15] = (struct vm_reg){0x141, 1, 0};
+    vm_state.registers[16] = (struct vm_reg){0x142, 1, 0};
+    vm_state.registers[17] = (struct vm_reg){0x143, 1, 0};
+    vm_state.registers[18] = (struct vm_reg){0x144, 1, 0};
+    vm_state.registers[19] = (struct vm_reg){0x180, 1, 0};
+    vm_state.registers[20] = (struct vm_reg){0xf11, 1, 0x637365353336};
+    vm_state.registers[21] = (struct vm_reg){0xf12, 2, 0};
+    vm_state.registers[22] = (struct vm_reg){0xf13, 2, 0};
+    vm_state.registers[23] = (struct vm_reg){0xf14, 2, 0};
+    vm_state.registers[24] = (struct vm_reg){0x300, 2, 0};
+    vm_state.registers[25] = (struct vm_reg){0x301, 2, 0};
+    vm_state.registers[26] = (struct vm_reg){0x302, 2, 0};
+    vm_state.registers[27] = (struct vm_reg){0x303, 2, 0};
+    vm_state.registers[28] = (struct vm_reg){0x304, 2, 0};
+    vm_state.registers[29] = (struct vm_reg){0x305, 2, 0};
+    vm_state.registers[30] = (struct vm_reg){0x306, 2, 0};
+    vm_state.registers[31] = (struct vm_reg){0x340, 2, 0};
+    vm_state.registers[32] = (struct vm_reg){0x341, 2, 0};
+    vm_state.registers[33] = (struct vm_reg){0x342, 2, 0};
+    vm_state.registers[34] = (struct vm_reg){0x343, 2, 0};
+    vm_state.registers[35] = (struct vm_reg){0x344, 2, 0};
+    vm_state.registers[36] = (struct vm_reg){0x34a, 2, 0};
+    vm_state.registers[37] = (struct vm_reg){0x34b, 2, 0};
+    vm_state.registers[38] = (struct vm_reg){0x3a0, 2, 0};
+    vm_state.registers[39] = (struct vm_reg){0x3b0, 2, 0};
+    vm_state.registers[40] = (struct vm_reg){0x3b1, 2, 0};
 
     vm_state.current_privilege = MACHINE_MODE;
     vm_state.virtual_pagetable = NULL;

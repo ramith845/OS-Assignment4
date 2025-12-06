@@ -7,14 +7,6 @@
 #include "defs.h"
 #include <stdbool.h>
 
-//defining traps
-const int INSTRUCTION_FAULT = 2;
-const int LOAD_FAULT = 1;
-const int INSTRUCTION_PAGE_FAULT = 12;
-const int LOAD_PAGE_FAULT = 13;
-const int STORE_PAGE_FAULT = 15;
-const int SYSTEM_CALL = 8;
-
 struct spinlock tickslock;
 uint ticks;
 
@@ -62,22 +54,19 @@ usertrap(void)
   uint64 trap_cause = r_scause();
   bool is_vm_process = strncmp(p->name, "vm-", 3) == 0;
 
-    //Fault handling
-    if (is_vm_process && (trap_cause == INSTRUCTION_FAULT || trap_cause == LOAD_FAULT ||
-                trap_cause == INSTRUCTION_PAGE_FAULT ||
-                trap_cause == LOAD_PAGE_FAULT || trap_cause == STORE_PAGE_FAULT)) {
-        trap_and_emulate();
+  if (is_vm_process && (trap_cause == 2 || trap_cause == 1 ||
+      trap_cause == 12 || trap_cause == 13 || trap_cause == 15))
+  {
+    trap_and_emulate();
+  }
+  else if (r_scause() == 8) {
+    if (killed(p)) {
+      exit(-1);
     }
 
-    //Handle system calls
-  else if (trap_cause == SYSTEM_CALL) {
-        if (killed(p)) {
-            exit(-1);
-        }
-
-        if (is_vm_process) {   //VM system calls
-            trap_and_emulate();
-        }
+    if (is_vm_process) {
+      trap_and_emulate();
+    }
     else{
     	// sepc points to the ecall instruction,
     	// but we want to return to the next instruction.
